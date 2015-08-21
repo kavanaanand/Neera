@@ -1,0 +1,1199 @@
+#define COLOR_SENSOR_PORT IN_3
+
+#define NUM_MOTORS	3
+#define NUM_FACES   6
+
+#define T_90    270
+#define T_CUT   7
+#define T_OVR   48
+
+#define MOTOR_ROTATE 	0
+#define MOTOR_SCAN 		1
+#define MOTOR_FLIP  	2
+
+#define T_SOFF  0
+#define T_SCNT  3
+#define T_SCNR  97
+#define T_SEDG  73
+
+#define T_TILT  85
+#define T_TAWY  25
+#define T_TREL  62
+#define T_THLD  160
+#define T_ADJ   3
+
+#define M_DELAY 10
+#define M_SCALE 12
+#define AMAX    24
+#define VMAX    100
+
+#define P_LOW   35
+#define P_HIGH  87
+
+#include "mcmoves.h"
+
+mutex      motor_vars;
+const byte motor_array[] = {OUT_A, OUT_B, OUT_C};
+bool       motor_on[]  = {false, false, false};
+bool       motor_go[]  = {false, false, false};
+bool       motor_up[]  = {false, false, false};
+long       motor_pos[]  = {0, 0, 0};
+long       motor_e[]   = {0, 0, 0};
+long       motor_v[]   = {0, 0, 0};
+long       motor_a[]   = {0, 0, 0};
+long       motor_x[]   = {0, 0, 0};
+long       motor_p[]   = {0, 0, 0};
+
+task MotorMove() {
+  long ms = CurrentTick();
+  while (true) {
+    Acquire(motor_vars);
+    for (int m = 0; m < NUM_MOTORS; m++) {
+      if (motor_on[m]) {
+        bool rev = false;
+        byte mot = motor_array[m];
+        long x = motor_x[m];
+        long v = motor_v[m];
+        long a = motor_a[m];
+        long p = motor_p[m];
+        long e = 0;
+        long ax = M_SCALE*MotorTachoCount(mot);
+        long ex = ax-x;
+        if (-M_SCALE < ex && ex < M_SCALE)
+          ax = x;
+        else if (motor_go[m])
+          e  = motor_e[m]-ex;
+        long d = motor_pos[m]-ax;
+        if (motor_up[m] ? (d < M_SCALE) : (d > -M_SCALE)) {
+          motor_go[m] = false;
+          e = 0;
+        }
+        if (d < 0) {
+          d = -d;
+          v = -v;
+          a = -a;
+          p = -p;
+          e = -e;
+          rev = true;
+        }
+        if (d >= M_SCALE) {
+          if (v >= 0) {
+            long dd = (v+AMAX/2)+(v*v)/(2*AMAX);
+            if (d >= dd) {
+              p = P_HIGH;
+              a = (AMAX*(VMAX-v))/VMAX;
+              e = 0;
+            } else {
+              a = -(v*v)/(2*d);
+              if (a < -v)
+                a = -v;
+              if (a < -AMAX)
+                a = -AMAX;
+              p = (P_HIGH*a*(VMAX-v))/(AMAX*VMAX);
+            }
+          } else {
+            a = -v;
+            if (a > AMAX)
+              a = AMAX;
+            p = (P_HIGH*a*(VMAX+v))/(AMAX*VMAX);
+          }
+        } else {
+          a = -v;
+          if (a < -AMAX)
+            a = -AMAX;
+          else if (a > AMAX)
+            a = AMAX;
+          p = (P_HIGH*a)/AMAX;
+        }
+        d = v+a/2;
+        v += a;
+        p += e;
+        if (p > P_HIGH) {
+          p = P_HIGH;
+          e = 0;
+        } else if (p < -P_HIGH) {
+          p = -P_HIGH;
+          e = 0;
+        }
+        if (rev) {
+          d = -d;
+          v = -v;
+          a = -a;
+          p = -p;
+          e = -e;
+        }
+        if (p != motor_p[m]) {
+          if (p > 0)
+            OnFwdEx(mot, p, RESET_NONE);
+          else if (p < 0)
+            OnRevEx(mot, -p, RESET_NONE);
+          else
+            OffEx(mot, RESET_NONE);
+          motor_p[m] = p;
+        }
+        motor_x[m] = ax+d;
+        motor_v[m] = v;
+        motor_a[m] = a;
+        motor_e[m] = e;
+      }
+    }
+    Release(motor_vars);
+    ms += M_DELAY;
+    long del = ms-CurrentTick();
+    if (del < 1)
+      del = 1;
+    else if (del > M_DELAY)
+      del = M_DELAY;
+    Wait(del);
+  }
+}
+
+
+void TurnOnMotors() {
+  Acquire(motor_vars);
+  for (int m = 0; m < NUM_MOTORS; m++)
+    motor_on[m] = true;
+  Release(motor_vars);
+}
+
+void TurnOffMotors() {
+  bool on;
+  do {
+    on = false;
+    Acquire(motor_vars);
+    for (int m = 0; m < NUM_MOTORS; m++) {
+      if (motor_on[m]) {
+        if (motor_go[m]) {
+          on = true;
+        } else {
+          byte mot = motor_array[m];
+          OffEx(mot, RESET_NONE);
+          motor_on[m] = false;
+          motor_v[m]  = 0;
+          motor_a[m]  = 0;
+          motor_p[m]  = 0;
+        }
+      }
+    }
+    Release(motor_vars);
+    Wait(1);
+  } while (on);
+}
+
+
+void WaitForMove(int m) {
+  bool go;
+  do {
+    Wait(1);
+    Acquire(motor_vars);
+    go = motor_go[m];
+    Release(motor_vars);
+  } while (go);
+}
+
+
+void MoveRelative(int m, long pos, long off = 0) {
+  Acquire(motor_vars);
+  motor_pos[m] += -M_SCALE*(pos+off);
+  motor_up[m] = (motor_pos[m] > motor_x[m]);
+  motor_on[m] = true;
+  motor_go[m] = true;
+  Release(motor_vars);
+  if (off != 0) {
+    WaitForMove(m);
+    Acquire(motor_vars);
+    motor_pos[m] -= -M_SCALE*off;
+    motor_up[m] = (motor_pos[m] > motor_x[m]);
+    motor_go[m] = true;
+    Release(motor_vars);
+  }
+}
+
+
+void MoveAbsolute(int m, long pos) {
+  Acquire(motor_vars);
+  motor_pos[m] = -M_SCALE*pos;
+  motor_up[m] = (motor_pos[m] > motor_x[m]);
+  motor_on[m] = true;
+  motor_go[m] = true;
+  Release(motor_vars);
+}
+
+
+int ChangeSign(int n, int d) {
+  return (n < 0) ? -d : ((n > 0) ? d : 0);
+}
+
+
+void ChangeFace(int r, int rn) {
+  MoveRelative(MOTOR_ROTATE, r*T_90, ChangeSign(r, T_OVR)+ChangeSign(rn, T_CUT));
+  WaitForMove(MOTOR_ROTATE);
+}
+
+
+void Rotate45(void) {
+  MoveRelative(MOTOR_ROTATE, -T_90/2);
+}
+
+
+void Turrn(int r) {
+  MoveRelative(MOTOR_ROTATE, r*T_90);
+  WaitForMove(MOTOR_ROTATE);
+}
+
+
+void ToExtremePosition(int m) {
+  long p0, p1;
+  byte mot = motor_array[m];
+  Acquire(motor_vars);
+  motor_on[m] = false;
+  Release(motor_vars);
+  OnFwdEx(mot, P_LOW, RESET_NONE);
+  p1 = MotorTachoCount(mot);
+  do {
+    Wait(50);
+    p0 = p1;
+    p1 = MotorTachoCount(mot);
+  } while (p0 < p1);
+  ResetTachoCount(mot);
+  Wait(100);
+}
+
+void ToCorner() {
+  MoveAbsolute(MOTOR_SCAN, T_SCNR);
+}
+
+void ToCenter() {
+  MoveAbsolute(MOTOR_SCAN, T_SCNT);
+  WaitForMove(MOTOR_SCAN);
+}
+
+void ToEdge() {
+  MoveAbsolute(MOTOR_SCAN, T_SEDG);
+}
+
+void ScanForWait() {
+  WaitForMove(MOTOR_SCAN);
+}
+
+bool in_place = false;
+
+void RelaxFlipMotor() {
+  in_place = false;
+  MoveAbsolute(MOTOR_FLIP, T_TAWY);
+  WaitForMove(MOTOR_FLIP);
+}
+
+void ReleaseTilt() {
+  in_place = false;
+  MoveAbsolute(MOTOR_FLIP, T_TREL);
+  WaitForMove(MOTOR_FLIP);
+}
+
+void ScanTurnWait() {
+  WaitForMove(MOTOR_SCAN);
+  WaitForMove(MOTOR_ROTATE);
+}
+
+void HoldTilt() {
+  in_place = true;
+  MoveAbsolute(MOTOR_FLIP, T_THLD);
+  WaitForMove(MOTOR_FLIP);
+}
+
+void Flip(int n = 1) {
+  if (in_place) {
+    Wait(100);
+  } else {
+    HoldTilt();
+    Wait(350);
+  }
+  for (int i = 0; i < n; i++) {
+    if (i > 0) {
+      WaitForMove(MOTOR_FLIP);
+      Wait(500);
+    }
+    int t = T_TILT;
+    MoveRelative(MOTOR_FLIP, t);
+    WaitForMove(MOTOR_FLIP);
+    Wait(150);
+    MoveRelative(MOTOR_FLIP, -t, -25);
+    WaitForMove(MOTOR_FLIP);
+  }
+}
+
+
+//-----------------------------------------------------------------------------
+// Face indices
+//-----------------------------------------------------------------------------
+
+#define U        0
+#define F        1
+#define D        2
+#define B        3
+#define R        4
+#define L        5
+
+int  uc = U;
+int  fc = F;
+
+//-----------------------------------------------------------------------------
+// Scan Cube
+//-----------------------------------------------------------------------------
+
+#define STR_R    "red"
+#define STR_B    "blue"
+#define STR_O    "orange"
+#define STR_G    "green"
+#define STR_W    "white"
+#define STR_Y    "yellow"
+
+#define CHR_R    'r'
+#define CHR_B    'b'
+#define CHR_O    'o'
+#define CHR_G    'g'
+#define CHR_W    'w'
+#define CHR_Y    'y'
+
+string clr_str[] = {STR_R, STR_B, STR_O, STR_G, STR_W, STR_Y};
+char clr_chr[] = {CHR_R, CHR_B, CHR_O, CHR_G, CHR_W, CHR_Y};
+byte clr_code[] = {0, 1, 2, 3, 4, 5};
+
+
+int FindColor(int c) {
+  int color = 4;
+  if (c == 9 || c == 8) {
+    color = 0;
+  } else if (c == 2) {
+    color = 1;
+  } else if (c == 7) {
+    color = 2;
+  } else if (c == 4) {
+    color = 3;
+  } else if (c == 6) {
+    color = 5;
+  } else {
+    color = 4;
+  }
+  return color;
+  }
+
+int GetColor() {
+  const int scan_max = 5;
+  int loop_color = 0;
+  int c = 4;
+  Wait(10);
+  byte color_num;
+  byte red_num;
+  byte green_num;
+  byte blue_num;
+  
+  for (int n = 0; n < scan_max; n++) {    
+    do {
+      Wait(1);
+    } while (!ReadSensorHTColor(COLOR_SENSOR_PORT,
+                                color_num,
+                                red_num,
+                                green_num,
+                                blue_num));
+
+    loop_color += color_num;
+  }
+  c = FindColor(loop_color/scan_max);
+  ClearLine(LCD_LINE2);
+  TextOut(54, LCD_LINE2, clr_str[c]);
+  return c;
+}
+
+
+byte msg_line = LCD_LINE1;
+
+string ScanFace(int n) {  
+  NumOut(5, LCD_LINE8, n);
+
+  string face = "555555555";
+  switch (n) {
+    case 1:  msg_line = LCD_LINE1; break;
+    case 2:  msg_line = LCD_LINE2; break;
+    case 3:  msg_line = LCD_LINE3; break;
+    case 4:  msg_line = LCD_LINE4; break;
+    case 5:  msg_line = LCD_LINE5; break;
+    case 6:  msg_line = LCD_LINE6; break;
+  }
+
+  ReleaseTilt();
+  MoveRelative(MOTOR_ROTATE, T_SOFF);
+  
+  ToCenter();
+  int c = GetColor();
+  face[8] = clr_code[c];
+
+  Rotate45();
+  ToCorner();    
+  ScanTurnWait();
+  c = GetColor();  
+  face[0] = clr_code[c];
+
+  Rotate45();
+  ToEdge();
+  ScanTurnWait();
+  c = GetColor();  
+  face[1] = clr_code[c];
+  
+  Rotate45();
+  ToCorner();    
+  ScanTurnWait();
+  c = GetColor();  
+  face[2] = clr_code[c];
+
+  Rotate45();
+  ToEdge();
+  ScanTurnWait();
+  c = GetColor();  
+  face[3] = clr_code[c];
+
+  Rotate45();
+  ToCorner();    
+  ScanTurnWait();
+  c = GetColor();  
+  face[4] = clr_code[c];
+
+  Rotate45();
+  ToEdge();
+  ScanTurnWait();
+  c = GetColor();
+  face[5] = clr_code[c];
+
+  Rotate45();
+  ToCorner();    
+  ScanTurnWait();
+  c = GetColor();  
+  face[6] = clr_code[c];
+
+  Rotate45();
+  ToEdge();
+  ScanTurnWait();
+  c = GetColor();  
+  face[7] = clr_code[c];  
+
+  MoveRelative(MOTOR_ROTATE, -T_SOFF);  
+  Acquire(motor_vars);
+  motor_pos[MOTOR_SCAN] = -M_SCALE*200;
+  motor_up[MOTOR_SCAN] = (motor_pos[MOTOR_SCAN] > motor_x[MOTOR_SCAN]);
+  motor_on[MOTOR_SCAN] = true;
+  motor_go[MOTOR_SCAN] = true;
+  Release(motor_vars);
+  
+  return face;
+}
+
+void setCubeValues(byte &cube[],string colors,int f){
+  int i = f*8;
+
+  if(f==4){
+    cube[i+0] = colors[2];    
+    cube[i+1] = colors[3];
+    cube[i+2] = colors[4];
+    cube[i+3] = colors[5];
+    cube[i+4] = colors[6];
+    cube[i+5] = colors[7];
+    cube[i+6] = colors[0];
+    cube[i+7] = colors[1];
+  } else {
+	cube[i+0] = colors[6];    
+	cube[i+1] = colors[7];
+	cube[i+2] = colors[0];
+	cube[i+3] = colors[1];
+	cube[i+4] = colors[2];
+	cube[i+5] = colors[3];
+	cube[i+6] = colors[4];
+	cube[i+7] = colors[5];
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Solve Cube
+//-----------------------------------------------------------------------------
+
+#define RFIX(RR)	((((RR)+1)&3)-1)
+#define POS(FF, OO) (((FF)*8)+(OO))
+#define MAP(UU, FF) (imap[((UU)*NUM_FACES)+(FF)]*NUM_FACES)
+#define TARGET 		42
+#define MV_MAX  	100
+#define NPIECE  	3
+
+void copy_cube(byte &cube0[], byte &cube1[]) {
+  int o = 0;
+  for (byte f = 0; f < NUM_FACES; f++)
+    for (int i = 0; i < 8; i++) {
+      cube0[o] = cube1[o];
+      o ++;
+    }
+}
+
+bool solved(byte &cube[]) {
+  int o = 0;
+  for (byte f = 0; f < NUM_FACES; f++)
+    for (int i = 0; i < 8; i++) {
+      if (cube[o++] != f)
+        return false;
+    }
+  return true;
+}
+
+int  mv_n;
+byte mv_f[MV_MAX];
+int  mv_r[MV_MAX];
+
+const byte opposite[] = {D, B, U, F, L, R};
+
+void add_mv(int f, int r) {
+  int  i   = mv_n;
+  bool mrg = false;
+  while (i > 0) {
+    i--;
+    int fi = mv_f[i];
+    if (f == fi) {
+      r += mv_r[i];
+      r = RFIX(r);
+      if (r != 0) {
+        mv_r[i] = r;
+      } else {
+        mv_n --;
+        while (i < mv_n) {
+          mv_f[i] = mv_f[i+1];
+          mv_r[i] = mv_r[i+1];
+          i++;
+        }
+      }
+      mrg = true;
+      break;
+    }
+    if (opposite[f] != fi)
+      break;
+  }
+  if (!mrg) {
+    mv_f[mv_n] = f;
+    mv_r[mv_n] = RFIX(r);
+    mv_n++;
+  }
+}
+
+void rot_edges(byte &cube[], int r,
+               int f0, int o0, int f1, int o1,
+               int f2, int o2, int f3, int o3) {
+  f0 *= 8;
+  f1 *= 8;
+  f2 *= 8;
+  f3 *= 8;
+  o0 += f0;
+  o1 += f1;
+  o2 += f2;
+  o3 += f3;
+  byte p;
+  switch (r) {
+  case 1:
+    p = cube[o3];
+    cube[o3] = cube[o2];
+    cube[o2] = cube[o1];
+    cube[o1] = cube[o0];
+    cube[o0] = p;
+    o0 ++; o1 ++; o2 ++; o3 ++;
+    p = cube[o3];
+    cube[o3] = cube[o2];
+    cube[o2] = cube[o1];
+    cube[o1] = cube[o0];
+    cube[o0] = p;
+    o0 = f0+((o0+1)&7); o1 = f1+((o1+1)&7);
+    o2 = f2+((o2+1)&7); o3 = f3+((o3+1)&7);
+    p = cube[o3];
+    cube[o3] = cube[o2];
+    cube[o2] = cube[o1];
+    cube[o1] = cube[o0];
+    cube[o0] = p;
+    break;
+
+  case 2:
+    p = cube[o0];
+    cube[o0] = cube[o2];
+    cube[o2] = p;
+    p = cube[o1];
+    cube[o1] = cube[o3];
+    cube[o3] = p;
+    o0 ++; o1 ++; o2 ++; o3 ++;
+    p = cube[o0];
+    cube[o0] = cube[o2];
+    cube[o2] = p;
+    p = cube[o1];
+    cube[o1] = cube[o3];
+    cube[o3] = p;
+    o0 = f0+((o0+1)&7); o1 = f1+((o1+1)&7);
+    o2 = f2+((o2+1)&7); o3 = f3+((o3+1)&7);
+    p = cube[o0];
+    cube[o0] = cube[o2];
+    cube[o2] = p;
+    p = cube[o1];
+    cube[o1] = cube[o3];
+    cube[o3] = p;
+    break;
+
+  case 3:
+    p = cube[o0];
+    cube[o0] = cube[o1];
+    cube[o1] = cube[o2];
+    cube[o2] = cube[o3];
+    cube[o3] = p;
+    o0 ++; o1 ++; o2 ++; o3 ++;
+    p = cube[o0];
+    cube[o0] = cube[o1];
+    cube[o1] = cube[o2];
+    cube[o2] = cube[o3];
+    cube[o3] = p;
+    o0 = f0+((o0+1)&7); o1 = f1+((o1+1)&7);
+    o2 = f2+((o2+1)&7); o3 = f3+((o3+1)&7);
+    p = cube[o0];
+    cube[o0] = cube[o1];
+    cube[o1] = cube[o2];
+    cube[o2] = cube[o3];
+    cube[o3] = p;
+    break;
+  }
+}
+
+void rotate(byte &cube[], int f, int r) {
+  r &= 3;
+  switch (f) {
+  case U:  rot_edges(cube, r, B, 4, R, 0, F, 0, L, 0); break;
+  case F:  rot_edges(cube, r, U, 4, R, 6, D, 0, L, 2); break;
+  case D:  rot_edges(cube, r, F, 4, R, 4, B, 0, L, 4); break;
+  case B:  rot_edges(cube, r, D, 4, R, 2, U, 0, L, 6); break;
+  case R:  rot_edges(cube, r, U, 2, B, 2, D, 2, F, 2); break;
+  case L:  rot_edges(cube, r, U, 6, F, 6, D, 6, B, 6); break;
+  }
+  f *= 8;
+  byte p;
+  switch (r) {
+  case 1:
+    p         = cube[f+7];
+    cube[f+7] = cube[f+5];
+    cube[f+5] = cube[f+3];
+    cube[f+3] = cube[f+1];
+    cube[f+1] = p;
+    p         = cube[f+6];
+    cube[f+6] = cube[f+4];
+    cube[f+4] = cube[f+2];
+    cube[f+2] = cube[f];
+    cube[f]   = p;
+    break;
+
+  case 2:
+    p         = cube[f+1];
+    cube[f+1] = cube[f+5];
+    cube[f+5] = p;
+    p         = cube[f+3];
+    cube[f+3] = cube[f+7];
+    cube[f+7] = p;
+    p         = cube[f];
+    cube[f]   = cube[f+4];
+    cube[f+4] = p;
+    p         = cube[f+2];
+    cube[f+2] = cube[f+6];
+    cube[f+6] = p;
+    break;
+
+  case 3:
+    p         = cube[f+1];
+    cube[f+1] = cube[f+3];
+    cube[f+3] = cube[f+5];
+    cube[f+5] = cube[f+7];
+    cube[f+7] = p;
+    p         = cube[f];
+    cube[f]   = cube[f+2];
+    cube[f+2] = cube[f+4];
+    cube[f+4] = cube[f+6];
+    cube[f+6] = p;
+    break;
+  }
+}
+
+int idx_ic;
+int idx_ie;
+int idx_idx[NPIECE];
+int idx_nc;
+int idx_ne;
+int idx;
+
+void index_init() {
+  idx_nc = 0;
+  idx_ne = 0;
+  idx = 0;
+}
+
+void index_last() {
+  idx = ((idx>>2)<<1)|(idx&1);
+}
+
+#define FIND_CORNER(F0, O0, F1, O1, F2, O2, I0, I1, I2) \
+  c0 = cube[POS(F0, O0)]; \
+  if (c0 == f0) { \
+    if (cube[POS(F1, O1)] == f1 && \
+        cube[POS(F2, O2)] == f2) return I2; \
+  } else if (c0 == f2) { \
+    if (cube[POS(F1, O1)] == f0 && \
+        cube[POS(F2, O2)] == f1) return I1; \
+  } else if (c0 == f1) { \
+    if (cube[POS(F1, O1)] == f2 && \
+        cube[POS(F2, O2)] == f0) return I0; \
+  }
+
+int find_corner(byte &cube[], byte f0, byte f1, byte f2) {
+  byte c0;
+  FIND_CORNER(U, 2, B, 4, R, 2, 0,  1,  2);
+  FIND_CORNER(U, 0, L, 0, B, 6, 3,  4,  5);
+  FIND_CORNER(U, 6, F, 0, L, 2, 6,  7,  8);
+  FIND_CORNER(U, 4, R, 0, F, 2, 9,  10, 11);
+  FIND_CORNER(D, 0, L, 4, F, 6, 12, 13, 14);
+  FIND_CORNER(D, 6, B, 0, L, 6, 15, 16, 17);
+  FIND_CORNER(D, 4, R, 4, B, 2, 18, 19, 20);
+  FIND_CORNER(D, 2, F, 4, R, 6, 21, 22, 23);
+  return -1;
+}
+
+int index_corner(byte &cube[], byte f0, byte f1, byte f2) {
+  int ic = find_corner(cube, f0, f1, f2);
+  for (int i = 0; i < idx_nc; i++) {
+    if (ic > idx_idx[i])
+      ic -= 3;
+  }
+  idx = (idx*idx_ic) + ic;
+  idx_idx[idx_nc++] = ic;
+  idx_ic -= 3;
+}
+
+#define FIND_EDGE(F0, O0, F1, O1, I0, I1) \
+  e0 = cube[POS(F0, O0)]; \
+  if (e0 == f0) { \
+    if (cube[POS(F1, O1)] == f1) return I1; \
+  } else if (e0 == f1) { \
+    if (cube[POS(F1, O1)] == f0) return I0; \
+  }
+
+int find_edge(byte &cube[], byte f0, byte f1) {
+  byte e0;
+  FIND_EDGE(U, 1, B, 5, 0,  1);
+  FIND_EDGE(U, 7, L, 1, 2,  3);
+  FIND_EDGE(U, 5, F, 1, 4,  5);
+  FIND_EDGE(U, 3, R, 1, 6,  7);
+  FIND_EDGE(L, 3, F, 7, 8,  9);
+  FIND_EDGE(B, 7, L, 7, 10, 11);
+  FIND_EDGE(D, 7, L, 5, 12, 13);
+  FIND_EDGE(R, 3, B, 3, 14, 15);
+  FIND_EDGE(D, 5, B, 1, 16, 17);
+  FIND_EDGE(F, 3, R, 7, 18, 19);
+  FIND_EDGE(D, 3, R, 5, 20, 21);
+  FIND_EDGE(D, 1, F, 5, 22, 23);
+  return -1;
+}
+
+void index_edge(byte &cube[], byte f0, byte f1) {
+  int ie = find_edge(cube, f0, f1);
+  for (int i = 0; i < idx_ne; i++) {
+    if (ie > idx_idx[i])
+      ie -= 2;
+  }
+  idx = (idx*idx_ie) + ie;
+  idx_idx[idx_ne++] = ie;
+  idx_ie -= 2;
+}
+
+void solve_phase(byte &cube[], int mtb, const byte &mtd[], bool dorot = true) {
+  int sz = ArrayLen(mtd)/mtb;
+  idx = sz-idx;
+  if (idx > 0) {
+    int i = (idx-1)*mtb;
+    byte b = mtd[i++];
+    if (b != 0xFF) {
+      const int mvm = mtb*2-1;
+      int mv = 0;
+      int f0 = b / 3;
+      int r0 = RFIX(b-(f0*3)+1);
+      add_mv(f0, r0);
+      if (dorot)
+        rotate(cube, f0, r0);
+      mv ++;
+      while (mv < mvm) {
+        b >>= 4;
+        if ((mv & 1) != 0)
+          b = mtd[i++];
+        byte b0 = b & 0xF;
+        if (b0 == 0xF)
+          break;
+        int f1 = b0 / 3;
+        r0 = RFIX(b0-(f1*3)+1);
+        if (f1 >= f0)
+          f1 ++;
+        f0 = f1;
+        add_mv(f0, r0);
+        if (dorot)
+          rotate(cube, f0, r0);
+        mv ++;
+      }
+    }
+  }
+}
+
+void solve_one(byte &cube[], bool dorot) {
+  mv_n = 0;
+
+  idx_ic = 24;
+  idx_ie = 24;
+
+  index_init();
+  index_edge(cube, D, F);
+  index_edge(cube, D, R);
+  solve_phase(cube, mtb0, mtd0);
+
+  index_init();
+  index_corner(cube, D, F, R);
+  index_edge(cube, F, R);
+  solve_phase(cube, mtb1, mtd1);
+
+  index_init();
+  index_edge(cube, D, B);
+  solve_phase(cube, mtb2, mtd2);
+
+  index_init();
+  index_corner(cube, D, R, B);
+  index_edge(cube, R, B);
+  solve_phase(cube, mtb3, mtd3);
+
+  index_init();
+  index_edge(cube, D, L);
+  solve_phase(cube, mtb4, mtd4);
+
+  index_init();
+  index_corner(cube, D, B, L);
+  index_edge(cube, B, L);
+  solve_phase(cube, mtb5, mtd5);
+
+  index_init();
+  index_corner(cube, D, L, F);
+  index_edge(cube, L, F);
+  solve_phase(cube, mtb6, mtd6);
+
+  index_init();
+  index_corner(cube, U, R, F);
+  index_corner(cube, U, F, L);
+  index_corner(cube, U, L, B);
+  solve_phase(cube, mtb7, mtd7);
+
+  index_init();
+  index_edge(cube, U, R);
+  index_edge(cube, U, F);
+  index_edge(cube, U, L);
+  index_last();
+  solve_phase(cube, mtb8, mtd8, dorot);
+}
+
+#define MAP(UU, FF) (imap[((UU)*NUM_FACES)+(FF)]*NUM_FACES)
+
+const byte imap[] = {
+-1,  0, -1,  1,  2,  3,
+ 4, -1,  5, -1,  6,  7,
+-1,  8, -1,  9, 10, 11,
+12, -1, 13, -1, 14, 15,
+16, 17, 18, 19, -1, -1,
+20, 21, 22, 23, -1, -1
+};
+
+const byte fmap[] = {
+U, F, D, B, R, L,
+U, B, D, F, L, R,
+U, R, D, L, B, F,
+U, L, D, R, F, B,
+F, U, B, D, L, R,
+F, D, B, U, R, L,
+F, R, B, L, U, D,
+F, L, B, R, D, U,
+D, F, U, B, L, R,
+D, B, U, F, R, L,
+D, R, U, L, F, B,
+D, L, U, R, B, F,
+B, U, F, D, R, L,
+B, D, F, U, L, R,
+B, R, F, L, D, U,
+B, L, F, R, U, D,
+R, U, L, D, F, B,
+R, F, L, B, D, U,
+R, D, L, U, B, F,
+R, B, L, F, U, D,
+L, U, R, D, B, F,
+L, F, R, B, U, D,
+L, D, R, U, F, B,
+L, B, R, F, D, U
+};
+
+const byte omap[] = {
+0, 0, 0, 0, 0, 0,
+4, 4, 4, 4, 0, 0,
+6, 0, 2, 4, 4, 0,
+2, 0, 6, 4, 0, 4,
+4, 4, 4, 4, 2, 6,
+0, 0, 0, 0, 6, 2,
+6, 6, 2, 6, 4, 0,
+2, 2, 6, 2, 0, 4,
+4, 4, 4, 4, 4, 4,
+0, 0, 0, 0, 4, 4,
+6, 4, 2, 0, 4, 0,
+2, 4, 6, 0, 0, 4,
+0, 0, 0, 0, 2, 6,
+4, 4, 4, 4, 6, 2,
+6, 2, 2, 2, 4, 0,
+2, 6, 6, 6, 0, 4,
+4, 2, 0, 6, 2, 2,
+2, 2, 2, 6, 2, 2,
+0, 2, 4, 6, 2, 2,
+6, 2, 6, 6, 2, 2,
+4, 6, 0, 2, 6, 6,
+6, 6, 6, 2, 6, 6,
+0, 6, 4, 2, 6, 6,
+2, 6, 2, 2, 6, 6,
+};
+
+int  solve_n;
+byte solve_fce[MV_MAX];
+int  solve_rot[MV_MAX];
+byte solve_cube[NUM_FACES*8];
+
+bool solve_nomap(byte &cube[]) {
+  solve_n = 0;
+  copy_cube(solve_cube, cube);
+  solve_one(solve_cube, true);
+
+  if (!solved(solve_cube))
+    return false;
+
+  solve_n = mv_n;
+  for (int i = 0; i < mv_n; i++) {
+    solve_fce[i] = mv_f[i];
+    solve_rot[i] = mv_r[i];
+  }
+  return true;
+}
+
+byte pmap[NUM_FACES];
+
+void solve_remap(byte &cube[], int map) {
+  for (int f = 0; f < NUM_FACES; f++)
+    pmap[fmap[map+f]] = f;
+
+  for (int f = 0; f < NUM_FACES; f++) {
+    int fs = fmap[map+f]*8;
+    int fd = f*8;
+    int os = omap[map+f];
+    for (int od = 0; od < 8; od++) {
+      solve_cube[fd+od] = pmap[cube[fs+os]];
+      os = (os+1)&7;
+    }
+  }
+
+  solve_one(solve_cube, false);
+  if (mv_n < solve_n) {
+    solve_n = mv_n;
+    for (int i = 0; i < mv_n; i++) {
+      solve_fce[i] = fmap[map+mv_f[i]];
+      solve_rot[i] = mv_r[i];
+    }
+  }
+}
+
+bool solve(byte &cube[]) {
+  if (!solve_nomap(cube))
+    return false;
+
+  if (solve_n <= TARGET)
+    return true;
+
+  for (int i = 1; i < NUM_FACES*4; i++) {
+    solve_remap(cube, i*NUM_FACES);
+    if (solve_n <= TARGET)
+      return true;
+  }
+
+  return true;
+}
+
+void manipulate(byte &cube[], int f, int r, int rn) {
+  int map = MAP(uc, fc);
+  if (fmap[map+U] == f) {
+    uc = fmap[map+D]; fc = fmap[map+B];
+    Wait(50);
+    Flip(2);
+  } else if (fmap[map+F] == f) {
+    uc = fmap[map+B]; fc = fmap[map+U];
+    Wait(50);
+    Flip();
+  } else if (fmap[map+D] == f) {
+    HoldTilt();
+  } else if (fmap[map+B] == f) {
+    uc = fmap[map+F]; fc = fmap[map+U];
+    ReleaseTilt();
+    Turrn(2);
+    Flip();
+  } else if (fmap[map+R] == f) {
+    uc = fmap[map+L]; fc = fmap[map+U];
+    ReleaseTilt();
+    Turrn(1);
+    Flip();
+  } else {
+    uc = fmap[map+R]; fc = fmap[map+U];
+    ReleaseTilt();
+    Turrn(-1);
+    Flip();
+  }
+  Wait(150);
+  rotate(cube, f, r);
+  ChangeFace(-r, -rn);
+}
+
+
+//-----------------------------------------------------------------------------
+// Scan Cube and call solver
+//-----------------------------------------------------------------------------
+
+bool SolveCube(byte &cube[]) {
+  bool solved = false;
+  SetSensorLowspeed(COLOR_SENSOR_PORT, true);
+  string ret;
+  ret = ScanFace(1);
+  setCubeValues(cube,ret,3);
+  Flip();
+  ret = ScanFace(2);
+  setCubeValues(cube,ret,2);
+  Flip();
+  ret = ScanFace(3);
+  setCubeValues(cube,ret,1);
+  Flip();
+  ret = ScanFace(4);
+  setCubeValues(cube,ret,0);
+  Turrn(-1);
+  Flip();
+  ret = ScanFace(5);
+  setCubeValues(cube,ret,4);
+  Flip(2);
+  ret = ScanFace(6);
+  setCubeValues(cube,ret,5);
+  TurnOffMotors();
+  
+  for (int i = 0; i < 6; i++) {
+    if (solve(cube)) {
+      solved = true;
+      break;
+    }
+  }
+  TurnOnMotors();
+  ClearScreen();
+  if (solved) {
+    Acquire(motor_vars);
+	motor_pos[MOTOR_SCAN] = -M_SCALE*200;
+	motor_up[MOTOR_SCAN] = (motor_pos[MOTOR_SCAN] > motor_x[MOTOR_SCAN]);
+	motor_on[MOTOR_SCAN] = true;
+	motor_go[MOTOR_SCAN] = true;
+	Release(motor_vars);
+    do {
+    Wait(1);
+    Acquire(motor_vars);
+    go = motor_go[MOTOR_SCAN];
+    Release(motor_vars);
+  	} while (go);
+  } 
+  return solved;
+}
+
+//-----------------------------------------------------------------------------
+// Calibration
+//-----------------------------------------------------------------------------
+
+int  recal = 0;
+void CalibrateFlipMotor() {
+  if (recal <= 0) {    
+    recal = 5;
+    ToExtremePosition(MOTOR_FLIP);
+    RelaxFlipMotor();
+  }
+  recal --;
+}
+
+
+//-----------------------------------------------------------------------------
+// Main
+//-----------------------------------------------------------------------------
+task main() {
+  start MotorMove;
+
+  byte cube[NUM_FACES*8];
+  bool go;
+  int index = 0;
+  bool solved = false;
+
+  for (byte f = 0; f < NUM_FACES; f++)
+    for (int i = 0; i < 8; i++)
+      cube[index++] = f;
+
+
+  CalibrateFlipMotor();  
+  ToExtremePosition(MOTOR_SCAN);  
+
+  Acquire(motor_vars);
+  motor_pos[MOTOR_SCAN] = -M_SCALE*200;
+  motor_up[MOTOR_SCAN] = (motor_pos[MOTOR_SCAN] > motor_x[MOTOR_SCAN]);
+  motor_on[MOTOR_SCAN] = true;
+  motor_go[MOTOR_SCAN] = true;
+  Release(motor_vars);
+    
+  do {
+    Wait(1);
+    Acquire(motor_vars);
+    go = motor_go[MOTOR_SCAN];
+    Release(motor_vars);
+  } while (go);
+
+  TurnOnMotors();  
+
+  for (int tries = 0; !solved && tries < 3; tries ++) {
+    if (SolveCube(cube)) {
+      Flip();
+      for (int i = 0; i < solve_n; i++) {
+        int fi = solve_fce[i];
+        int ri = solve_rot[i];
+        int fo = opposite[fi];
+        int rn = 0;
+        for (int j = i+1; rn == 0 && j < solve_n; j++) {
+          if (solve_fce[j] != fo)
+            rn = solve_rot[j];
+        }
+        manipulate(cube, fi, ri, rn);
+      }
+      solved = true;
+    }
+  }
+
+  Acquire(motor_vars);
+  motor_pos[MOTOR_SCAN] = -M_SCALE*200;
+  motor_up[MOTOR_SCAN] = (motor_pos[MOTOR_SCAN] > motor_x[MOTOR_SCAN]);
+  motor_on[MOTOR_SCAN] = true;
+  motor_go[MOTOR_SCAN] = true;
+  Release(motor_vars);
+
+  RelaxFlipMotor();
+  
+  do {
+    Wait(1);
+    Acquire(motor_vars);
+    go = motor_go[MOTOR_SCAN];
+    Release(motor_vars);
+  } while (go);
+
+  if (solved)
+      Turrn(4);
+}
